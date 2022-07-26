@@ -1,0 +1,227 @@
+# Define hosts this will run on
+hosts: all # run on the "all" hosts category from ansible-hosts.txt
+  # become means be superuser
+  become: true
+  remote_user: ubuntu
+  
+  #Install pre reqs
+  tasks:
+  - name: Install packages that allow apt to be used over HTTPS
+    apt:
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg-agent
+      - software-properties-common
+  
+  - name: Add an apt signing key for Docker
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+  
+  - name: Add apt repository for stable version
+    apt_repository:
+      repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu xenial stable
+      state: present
+  
+  - name: Install docker and its dependecies
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - docker-ce 
+      - docker-ce-cli 
+      - containerd.io
+      
+  - name: verify docker installed, enabled, and started
+    service:
+      name: docker
+      state: started
+      enabled: yes
+      
+  # Disbale swap for k8s
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb >= 0
+    
+  #Set-up apt for k8s
+  - name: Add an apt signing key for Kubernetes
+    apt_key:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      state: present
+  - name: Adding apt repository for Kubernetes
+    apt_repository:
+      repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+      state: present
+      filename: kubernetes.list
+  - name: Install Kubernetes binaries
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+        # it is usually recommended to specify which version you want to install
+        - kubelet=1.23.6-00
+        - kubeadm=1.23.6-00
+        - kubectl=1.23.6-00
+        
+  - name: hold kubernetes binary versions (prevent from being updated)
+    dpkg_selections:
+      name: "{{ item }}"
+      selection: hold
+    loop:
+      - kubelet
+      - kubeadm
+      - kubectl
+        
+# this has to do with nodes having different internal/external/mgmt IPs
+# {{ node_ip }} comes from vagrant, which I'm not using yet
+#  - name: Configure node ip - 
+#    lineinfile:
+#      path: /etc/default/kubelet
+#      line: KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}
+  - name: Restart kubelet
+    service:
+      name: kubelet
+      daemon_reload: yes
+      state: restarted
+      
+  - name: add ubuntu user to docker
+    user:
+      name: ubuntu
+      group: docker
+  
+  - name: reboot to apply swap disable
+    reboot:
+      reboot_timeout: 180 #allow 3 minutes for reboot to happen
+- hosts: kube_server
+  become: true
+  remote_user: ubuntu
+  
+  vars_files:
+    - ansible-vars.yml
+    
+  tasks:
+  - name: set docker to use systemd cgroups driver
+    copy:
+      dest: "/etc/docker/daemon.json"
+      content: |
+        {
+          "exec-opts": ["native.cgroupdriver=systemd"]
+        }
+  - name: restart docker
+    service:
+      name: docker
+      state: restarted
+    
+  - name: Initialize Kubernetes cluster
+    command: "kubeadm init --pod-network-cidr {{ pod_cidr }}"
+    args:
+      creates: /etc/kubernetes/admin.conf # skip this task if the file already exists
+    register: kube_init
+    
+  - name: show kube init info
+    debug:
+      var: kube_init
+      
+  - name: Create .kube directory in user home
+    file:
+      path: "{{ home_dir }}/.kube"
+      state: directory
+      owner: 1000
+      group: 1000
+  - name: Configure .kube/config files in user home
+    copy:
+      src: /etc/kubernetes/admin.conf
+      dest: "{{ home_dir }}/.kube/config"
+      remote_src: yes
+      owner: 1000
+      group: 1000
+      
+  - name: restart kubelet for config changes
+    service:
+      name: kubelet
+      state: restarted
+      
+  - name: get flannel networking
+    get_url:
+      url: https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      dest: "{{ home_dir }}/kube-flannel.yml"
+      
+  - name: apply flannel networking
+    become: no
+    command: kubectl apply -f "{{ home_dir }}/kube-flannel.yml"
+    
+  - name: get dashboard
+    get_url:
+      url: https://raw.githubusercontent.com/kubernetes/dashboard/v2.5.0/aio/deploy/recommended.yaml
+      dest: "{{ home_dir }}/dashboard.yaml"
+    
+  - name: apply dashboard
+    become: no
+    command: kubectl apply -f "{{ home_dir }}/dashboard.yaml"
+- hosts: kube_server
+  become: false
+  remote_user: ubuntu
+  
+  vars_files:
+    - ansible-vars.yml
+    
+  tasks:
+  - name: Extract the join command
+    become: true
+    command: "kubeadm token create --print-join-command"
+    register: join_command
+    
+  - name: show join command
+    debug:
+      var: join_command
+      
+  - name: Save kubeadm join command for cluster
+    local_action: copy content={{ join_command.stdout_lines | last | trim }} dest={{ join_command_location }} # defaults to your local cwd/join_command.out
+- hosts: kube_agents
+  become: true
+  remote_user: ubuntu
+  
+  vars_files:
+    - ansible-vars.yml
+    
+  tasks:
+  - name: set docker to use systemd cgroups driver
+    copy:
+      dest: "/etc/docker/daemon.json"
+      content: |
+        {
+          "exec-opts": ["native.cgroupdriver=systemd"]
+        }
+  - name: restart docker
+    service:
+      name: docker
+      state: restarted
+    
+  - name: read join command
+    debug: msg={{ lookup('file', join_command_location) }}
+    register: join_command_local
+    
+  - name: show join command
+    debug:
+      var: join_command_local.msg
+      
+  - name: join agents to cluster
+    command: "{{ join_command_local.msg }}"
