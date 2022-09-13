@@ -90,12 +90,6 @@ hosts: all # run on the "all" hosts category from ansible-hosts.txt
       - kubeadm
       - kubectl
         
-# this has to do with nodes having different internal/external/mgmt IPs
-# {{ node_ip }} comes from vagrant, which I'm not using yet
-#  - name: Configure node ip - 
-#    lineinfile:
-#      path: /etc/default/kubelet
-#      line: KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}
   - name: Restart kubelet
     service:
       name: kubelet
